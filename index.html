@@ -181,6 +181,10 @@ input[type=range]::-moz-range-thumb{width:22px; height:22px; border:0; border-ra
   background:var(--surface); color:var(--paper); border-radius:var(--r-ctl);
   padding:var(--s3) var(--s4); font-size:14px; margin:0 var(--s4) var(--s4);
 }
+.notice{display:flex; gap:var(--s3); align-items:flex-start; border-left:4px solid var(--accent); line-height:1.45;}
+.notice span{flex:1;}
+.notice .x{background:none; border:0; color:inherit; font-size:18px; line-height:1; padding:2px 4px; cursor:pointer; min-width:32px; min-height:32px;}
+#setup .notice{margin:var(--s5) 0 0;}
 .hidden{display:none !important;}
 
 @media (hover:hover) and (pointer:fine){
@@ -203,6 +207,7 @@ input[type=range]::-moz-range-thumb{width:22px; height:22px; border:0; border-ra
       <button class="btn wide" id="pick">Choose videos</button>
       <p class="note" id="storagenote"></p>
     </div>
+    <div class="warn notice hidden" id="notice2" role="alert"><span></span><button type="button" class="x" aria-label="Dismiss">✕</button></div>
     <div id="importing" class="hidden" style="margin-top:var(--s6)">
       <div class="track"><i id="ibar"></i></div>
       <p class="note" id="itext" style="margin-top:var(--s3)"></p>
@@ -217,6 +222,7 @@ input[type=range]::-moz-range-thumb{width:22px; height:22px; border:0; border-ra
     <span class="count" id="count" style="margin-left:auto; margin-right:var(--s2);"></span>
     <button class="btn" id="mainadd" style="min-height:36px; padding:0 var(--s3); font-size:14px;">Add</button>
   </div>
+  <div class="warn notice hidden" id="notice" role="alert"><span></span><button type="button" class="x" aria-label="Dismiss">✕</button></div>
   <div class="warn hidden" id="volatile">Keep this tab open — this tablet won't save the library if the page reloads.</div>
   <div class="grid" id="grid"></div>
 </section>
@@ -302,13 +308,23 @@ function openDB(){
 }
 function tx(mode){ return db.transaction(STORE, mode).objectStore(STORE); }
 
+/* Records that couldn't be saved live in `mem` (flagged volatile) for this
+   session only. Never try to re-save them — that would re-copy the whole file. */
 async function putRecord(rec){
-  if (!db) { mem.push(rec); return; }
-  await new Promise((res, rej) => { const r = tx("readwrite").put(rec); r.onsuccess = res; r.onerror = () => rej(r.error); });
+  if (!db || rec.volatile) { if (!mem.includes(rec)) mem.push(rec); return; }
+  await new Promise((res, rej) => {
+    let t;
+    try { t = db.transaction(STORE, "readwrite"); } catch (e) { return rej(e); }
+    t.objectStore(STORE).put(rec);
+    t.oncomplete = res;                       /* resolve only once it's really on disk */
+    t.onerror = () => rej(t.error);
+    t.onabort = () => rej(t.error || new DOMException("Save aborted", "AbortError"));
+  });
 }
 async function allRecords(){
-  if (!db) return mem.slice();
-  return new Promise(res => { const r = tx("readonly").getAll(); r.onsuccess = () => res(r.result || []); r.onerror = () => res([]); });
+  let saved = [];
+  if (db) saved = await new Promise(res => { const r = tx("readonly").getAll(); r.onsuccess = () => res(r.result || []); r.onerror = () => res([]); });
+  return saved.concat(mem);                   /* unsaved videos still show up */
 }
 async function clearAll(){
   mem.length = 0;
@@ -316,15 +332,13 @@ async function clearAll(){
   await new Promise(res => { const r = tx("readwrite").clear(); r.onsuccess = res; r.onerror = res; });
 }
 async function deleteRecord(id){
-  if (!db) { 
-    const idx = mem.findIndex(r => r.id === id);
-    if (idx !== -1) mem.splice(idx, 1);
-    return; 
-  }
-  await new Promise(res => { 
-    const r = tx("readwrite").delete(id); 
-    r.onsuccess = res; 
-    r.onerror = res; 
+  const idx = mem.findIndex(r => r.id === id);
+  if (idx !== -1) { mem.splice(idx, 1); return; }
+  if (!db) return;
+  await new Promise(res => {
+    const r = tx("readwrite").delete(id);
+    r.onsuccess = res;
+    r.onerror = res;
   });
 }
 
@@ -460,34 +474,82 @@ function renderGrid(){
     grid.appendChild(card);
   });
   $("count").textContent = library.length + (library.length === 1 ? " video" : " videos");
-  $("volatile").classList.toggle("hidden", !volatileMode);
+  $("volatile").classList.toggle("hidden", !(!db || mem.length));
 }
 
 /* ---------------------------------------------------------------
    Import
 ---------------------------------------------------------------- */
-async function importFiles(files){
-  const list = Array.from(files).filter(f => f.type.startsWith("video/") || /\.(mp4|m4v|webm|mkv|mov|3gp)$/i.test(f.name));
-  if (!list.length) return;
+const GB = n => (n / 1073741824).toFixed(1) + " GB";
 
+async function freeBytes(){
+  try {
+    const e = await navigator.storage.estimate();
+    if (e && e.quota) return Math.max(0, e.quota - (e.usage || 0));
+  } catch {}
+  return null;                                 /* unknown — just try */
+}
+
+function notify(text){
+  ["notice", "notice2"].forEach(id => {
+    const el = $(id);
+    el.querySelector("span").textContent = text;
+    el.classList.toggle("hidden", !text);
+  });
+}
+
+async function importFiles(files){
+  const all = Array.from(files);
+  const list = all.filter(f => f.type.startsWith("video/") || /\.(mp4|m4v|webm|mkv|mov|3gp)$/i.test(f.name));
+  const problems = all.filter(f => !list.includes(f))
+    .map(f => `"${f.name}" isn't a video type this tablet can play here.`);
+  if (!list.length){ notify(problems.join(" ")); return; }
+
+  notify("");
   show("setup");
   $("importing").classList.remove("hidden");
   $("pick").disabled = true;
+  keepAwake(true);                             /* a sleeping screen can kill a long copy */
 
+  let tempOnly = 0;
   for (let i = 0; i < list.length; i++){
     const f = list[i];
-    $("itext").textContent = `Adding ${i + 1} of ${list.length} — ${f.name}`;
+    const big = f.size > 1073741824;
+    $("itext").textContent = `Adding ${i + 1} of ${list.length} — ${f.name} (${GB(f.size)})` +
+      (big ? ". Big files take several minutes to copy — keep this screen open." : "");
     $("ibar").style.width = ((i / list.length) * 100) + "%";
+
     const {thumb, duration} = await grabFrame(f);
     const rec = {id: uid(), title: prettyTitle(f.name), blob: f, thumb, duration, added: Date.now()};
+
+    const free = await freeBytes();
+    if (free !== null && f.size > free){
+      rec.volatile = true; mem.push(rec); tempOnly++;
+      problems.push(`"${f.name}" is ${GB(f.size)}, but Video Box can only save about ${GB(free)} more on this tablet.`);
+      continue;
+    }
     try { await putRecord(rec); }
-    catch { volatileMode = true; mem.push(rec); }
+    catch (err) {
+      rec.volatile = true; mem.push(rec); tempOnly++;
+      const full = err && /quota/i.test(err.name + " " + err.message);
+      problems.push(full
+        ? `"${f.name}" (${GB(f.size)}) didn't fit — the tablet ran out of room for Video Box.`
+        : `"${f.name}" couldn't be saved (${(err && err.name) || "unknown error"}).`);
+    }
+  }
+  if (tempOnly){
+    volatileMode = true;
+    problems.push("Those videos play for now, but will disappear if the page reloads. " +
+      "Free up space on the tablet (Video Box keeps its own copy, so a 6 GB video needs 6 GB free on top of the original), " +
+      "or use a smaller, compressed version of the video, then add it again.");
   }
 
+  keepAwake(false);
   $("ibar").style.width = "100%";
   $("importing").classList.add("hidden");
   $("pick").disabled = false;
   await refresh();
+  notify(problems.join(" "));
 }
 
 async function refresh(){
@@ -663,6 +725,7 @@ $("wipe").addEventListener("click", async () => {
 ---------------------------------------------------------------- */
 $("pick").addEventListener("click", () => $("filein").click());
 $("mainadd").addEventListener("click", () => $("filein").click());
+document.querySelectorAll(".notice .x").forEach(b => b.addEventListener("click", () => notify("")));
 $("filein").addEventListener("change", e => { importFiles(e.target.files); e.target.value = ""; });
 
 (async function boot(){

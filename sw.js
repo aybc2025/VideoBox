@@ -1,6 +1,6 @@
 /* Caches the app itself so it opens with no connection.
    The videos are not here — they live in IndexedDB, added from the tablet. */
-const CACHE = "videobox-v1";
+const CACHE = "videobox-v2";
 const SHELL = [
   "./",
   "./index.html",
