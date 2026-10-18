@@ -272,6 +272,7 @@ input[type=range]::-moz-range-thumb{width:22px; height:22px; border:0; border-ra
       <p class="note">Turn this on if the play button or seek bar misbehaves on this device.</p>
       <button class="btn ghost wide" id="wipe">Remove all videos</button>
       <p class="note" id="storagenote2"></p>
+      <p class="note" id="offlinenote"></p>
       <button class="btn wide" id="closesheet">Done</button>
     </div>
   </div>
@@ -704,7 +705,19 @@ markbtn.addEventListener("contextmenu", e => e.preventDefault());
 async function openSheet(){
   $("native").checked = useNative();
   $("storagenote2").textContent = await storageLine();
+  $("offlinenote").textContent = await offlineLine();
   $("sheet").setAttribute("data-on", "");
+}
+async function offlineLine(){
+  let ready = false, persisted = false;
+  try {
+    ready = !!navigator.serviceWorker?.controller &&
+      !!(await caches.match(new URL("index.html", location.href).href));
+  } catch {}
+  try { persisted = await navigator.storage.persisted(); } catch {}
+  if (!ready) return "✗ Not ready for offline yet. Close Video Box, reopen it with internet on, then check here again.";
+  return persisted ? "✓ Ready to open with no internet."
+                   : "✓ Ready to open with no internet. (The tablet may clear it if storage runs very low.)";
 }
 function closeSheet(){ $("sheet").removeAttribute("data-on"); }
 $("veil").addEventListener("click", closeSheet);
@@ -729,13 +742,14 @@ document.querySelectorAll(".notice .x").forEach(b => b.addEventListener("click",
 $("filein").addEventListener("change", e => { importFiles(e.target.files); e.target.value = ""; });
 
 (async function boot(){
+  /* Register first, so a hiccup below can never stop offline setup */
+  if ("serviceWorker" in navigator){
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
   db = await openDB();
   volatileMode = !db;
   try { await navigator.storage.persist(); } catch {}
   await refresh();
-  if ("serviceWorker" in navigator){
-    navigator.serviceWorker.register("sw.js").catch(() => {});
-  }
 })();
 
 })();
